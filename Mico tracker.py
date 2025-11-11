@@ -59,8 +59,9 @@ def looks_like_login(page: Page) -> bool:
     if AUTH_BASE.lower() in url or any(k in url for k in LOGIN_KEYWORDS):
         return True
     try:
-        if page.locator("input[type='password']").first.is_visible(timeout=2000): return True
-        if page.locator("input[name='username']").first.is_visible(timeout=2000): return True
+        # Use short timeouts here to avoid long waits
+        if page.locator("input[type='password']").is_visible(timeout=2000): return True
+        if page.locator("input[name='username']").is_visible(timeout=2000): return True
     except Exception:
         pass
     return False
@@ -79,16 +80,17 @@ def try_fill_login(page: Page, username: str, password: str, timeout_ms: int = 6
         pass_box.wait_for(state="visible", timeout=timeout_ms / 2)
         pass_box.fill(password)
 
-        # Submit and wait for the navigation to the Home page to complete.
-        log.info("Submitting password and waiting for page to load...")
+        # Submit and wait for whatever navigation happens next.
+        log.info("Submitting password and waiting for navigation to complete...")
         with page.expect_navigation(wait_until="load", timeout=timeout_ms):
             page.locator("button[type='submit'][name='action'][value='default']._button-login-password").first.click()
 
     except Exception as e:
         page.screenshot(path="debug_screenshot.png", full_page=True)
-        raise RuntimeError(f"Failed to complete login form steps: {e}")
+        raise RuntimeError(f"Failed during login form steps: {e}")
 
-    log.info("Login form submitted successfully. Expected to be on Home page.")
+    log.info("Login form submitted.")
+
 
 def ensure_logged_in(
     context: BrowserContext,
@@ -98,41 +100,34 @@ def ensure_logged_in(
     timeout_ms: int,
     auth_state_path: Path,
 ) -> None:
-    # This function's only job is to make sure the context is authenticated.
-    # It doesn't care which page it lands on after login.
     page = context.new_page()
-    log.info("Checking authentication by navigating to target URL...")
+    log.info("Checking authentication status...")
     try:
-        page.goto(visits_url, wait_until="domcontentloaded", timeout=timeout_ms)
-        # Give it a moment to redirect to the login page if needed
-        page.wait_for_load_state("load", timeout=20000)
+        page.goto(visits_url, wait_until="load", timeout=25000)
     except PWTimeout:
-        log.warning("Page took a long time to load during auth check, continuing...")
+        log.warning("Initial page load for auth check was slow, continuing...")
 
     if looks_like_login(page):
         log.info("Detected login page — performing login.")
         try_fill_login(page, username, password, timeout_ms=timeout_ms)
-        # After login, we might be on the home page. Check we are not on a login page.
-        if looks_like_login(page):
-            raise RuntimeError("Login did not succeed (still on login page after attempt).")
-        log.info("Login successful. Saving authentication state.")
+        # Trust that the login worked. We will verify by navigating to the page in main().
+        log.info("Login attempt complete. Saving authentication state.")
         context.storage_state(path=str(auth_state_path))
     else:
-        log.info("Existing auth state looks valid; no login needed.")
+        log.info("Already logged in; auth state is valid.")
     page.close()
 
+
 def parse_visible_table_to_df(page: Page) -> Optional[pd.DataFrame]:
-    log.info("Starting precise HTML table parsing with BeautifulSoup.")
+    log.info("Starting precise HTML table parsing...")
     header_table_locator = page.locator("div.ui-jqgrid-hdiv table.ui-jqgrid-htable").first
-    if not header_table_locator.count():
-        return None
+    if not header_table_locator.count(): return None
     header_html = header_table_locator.inner_html()
     soup_headers = BeautifulSoup(header_html, "lxml")
     headers = [th.get_text(strip=True) for th in soup_headers.select("thead tr th") if th.get_text(strip=True)]
 
     body_table_locator = page.locator("table.ui-jqgrid-btable:visible").first
-    if not body_table_locator.count():
-        return None
+    if not body_table_locator.count(): return None
     body_html = body_table_locator.inner_html()
     soup_body = BeautifulSoup(body_html, "lxml")
     data_rows = [
@@ -149,6 +144,7 @@ def parse_visible_table_to_df(page: Page) -> Optional[pd.DataFrame]:
         df.columns = [f"col_{i+1}" for i in range(df.shape[1])]
     df.dropna(how='all', inplace=True)
     return df
+
 
 def post_to_google_chat(df: pd.DataFrame, webhook_url: str, site_id: str):
     if not webhook_url:
@@ -192,24 +188,21 @@ def post_to_google_chat(df: pd.DataFrame, webhook_url: str, site_id: str):
     except requests.exceptions.RequestException as e:
         log.error(f"Failed to post message to Google Chat: {e}")
 
+
 # --- Main Execution ---
 
 def main():
     parser = argparse.ArgumentParser(description="Microlise TMC → Site Visits scraper (Playwright).")
     parser.add_argument("--username", default=DEFAULT_USERNAME)
     parser.add_argument("--password", default=DEFAULT_PASSWORD)
-    # ... (rest of the arguments) ...
     parser.add_argument("--site-id", default="218")
     parser.add_argument("--auth-state", default=DEFAULT_AUTH_STATE)
     parser.add_argument("--headless", default="true", choices=["true", "false"])
     parser.add_argument("--timeout", type=int, default=60000)
     parser.add_argument("--csv", default="visits.csv")
-    parser.add_argument("--json", default="visits_raw.json")
     parser.add_argument("--screenshot", default="debug_screenshot.png")
-    parser.add_argument("--api-wait-timeout", type=int, default=15000)
     parser.add_argument("--webhook-url", default=DEFAULT_WEBHOOK_URL)
     args = parser.parse_args()
-
 
     auth_state_path = Path(args.auth_state)
     visits_url = f"{BASE}{VISITS_PATH_TMPL.format(site_id=args.site_id)}"
@@ -226,7 +219,7 @@ def main():
         final_df = None
 
         try:
-            # Step 1: Make sure we are logged in. This might leave us on the Home page.
+            # Step 1: Make sure we are logged in. This may leave us on the Home page.
             ensure_logged_in(
                 context=context,
                 visits_url=visits_url,
@@ -238,21 +231,26 @@ def main():
 
             # Step 2: Now that we are authenticated, navigate DIRECTLY to the visits page.
             page = context.new_page()
-            log.info("Authentication complete. Navigating directly to the Site Visits page...")
+            log.info("Navigating to the Site Visits page to get data...")
             page.goto(visits_url, wait_until="load", timeout=args.timeout)
-            log.info("Successfully landed on the Site Visits page.")
 
-            # Step 3: Refresh the page to trigger the data grid's API call.
-            log.info("Refreshing the page to ensure data grid initializes...")
+            # Step 3: Verify we are on the correct page. If not, fail gracefully.
+            if looks_like_login(page):
+                log.error("Authentication failed. Landed on login page when trying to access visits.")
+                raise RuntimeError("Authentication failed; could not access protected page.")
+            
+            log.info("Successfully on the Site Visits page.")
+
+            # Step 4: Refresh the page to trigger the data grid's API call.
+            log.info("Refreshing page to ensure data grid populates...")
             page.reload(wait_until="domcontentloaded", timeout=30000)
             
-            # Step 4: Wait for the grid to load its data. We will use the HTML fallback
-            # method as it has proven to be the most reliable in this environment.
+            # Step 5: Wait for the grid to load its data.
             log.info("Waiting for data rows to appear in the HTML table...")
             real_row_selector = "table.ui-jqgrid-btable tbody tr:not(.jqgfirstrow)"
             try:
                 page.wait_for_selector(real_row_selector, timeout=25000)
-                log.info("Real data rows found in table. Proceeding with HTML parsing.")
+                log.info("Real data rows found in table.")
             except PWTimeout:
                 log.error("Timed out waiting for data rows in the HTML table after refresh.")
                 raise RuntimeError("Could not find data in the HTML table.")
@@ -261,7 +259,7 @@ def main():
             if final_df is None or final_df.empty:
                 raise RuntimeError("HTML table parsing failed even after waiting for rows.")
 
-            log.info(f"--- Scraped Data (from HTML Table) ---\n{final_df.to_string()}")
+            log.info(f"--- Scraped Data ---\n{final_df.to_string()}")
             final_df.to_csv(args.csv, index=False)
             log.info(f"Wrote final data to CSV: {args.csv} (rows={final_df.shape[0]})")
             post_to_google_chat(final_df, args.webhook_url, args.site_id)

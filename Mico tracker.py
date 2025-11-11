@@ -3,24 +3,7 @@
 
 """
 Microlise TMC → Site Visits (Store 218) Scraper — Playwright (Python)
-
-Dependencies (should be in requirements.txt):
-  playwright
-  pandas
-  beautifulsoup4
-  lxml
-  requests
-
-Usage (GitHub Actions):
-  This script is designed to be run by the .github/workflows/microlise_scraper.yml workflow.
-  It uses GitHub Secrets for credentials.
-
-Usage (Local):
-  # (Recommended) Set environment variable for webhook
-  export GOOGLE_CHAT_WEBHOOK_URL="your_new_webhook_url"
-
-  # Run the script
-  python Mico_tracker.py --password YourPassword
+Final version, handles redirect to Home page after login.
 """
 
 import os
@@ -51,8 +34,6 @@ DEFAULT_USERNAME = os.getenv("MICROLISE_USERNAME", "Store218")
 DEFAULT_PASSWORD = os.getenv("MICROLISE_PASSWORD", "Store218")
 DEFAULT_AUTH_STATE = os.getenv("MICROLISE_AUTH_STATE", "auth_state.json")
 
-# SECURITY WARNING: It is highly recommended to use an environment variable for the webhook.
-# This hardcoded URL is a security risk and should be replaced.
 DEFAULT_WEBHOOK_URL = os.getenv(
     "GOOGLE_CHAT_WEBHOOK_URL",
     "https://chat.googleapis.com/v1/spaces/AAAAE9Syx9g/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=yrFCiWB27_A0Wxoev2zRpvnkLrnYCmwGP86EeOZDTKE"
@@ -78,10 +59,8 @@ def looks_like_login(page: Page) -> bool:
     if AUTH_BASE.lower() in url or any(k in url for k in LOGIN_KEYWORDS):
         return True
     try:
-        if page.locator("input[type='password']").first.is_visible(): return True
-        if page.locator("input[name='username']").first.is_visible(): return True
-        if page.get_by_role("button", name=lambda n: n and ("log" in n.lower() or "sign" in n.lower() or "continue" in n.lower())).count():
-            return True
+        if page.locator("input[type='password']").first.is_visible(timeout=2000): return True
+        if page.locator("input[name='username']").first.is_visible(timeout=2000): return True
     except Exception:
         pass
     return False
@@ -91,30 +70,25 @@ def try_fill_login(page: Page, username: str, password: str, timeout_ms: int = 6
     try:
         # Step 1: Username
         user_box = page.locator("input[name='username'][id='username']").first
-        user_box.wait_for(timeout=timeout_ms / 2)
+        user_box.wait_for(state="visible", timeout=timeout_ms / 2)
         user_box.fill(username)
         page.locator("button[type='submit'][name='action'][value='default']._button-login-id").first.click()
 
         # Step 2: Password
         pass_box = page.locator("input[name='password'][id='password']").first
-        pass_box.wait_for(timeout=timeout_ms / 2)
+        pass_box.wait_for(state="visible", timeout=timeout_ms / 2)
         pass_box.fill(password)
 
-        # KEY FIX: Use "load" instead of "networkidle" for reliability in GitHub Actions.
+        # Submit and wait for the navigation to the Home page to complete.
         log.info("Submitting password and waiting for page to load...")
         with page.expect_navigation(wait_until="load", timeout=timeout_ms):
             page.locator("button[type='submit'][name='action'][value='default']._button-login-password").first.click()
 
-        # NEW: Add an explicit wait to confirm we landed on the right page.
-        log.info("Login submitted. Verifying landing page by looking for the grid header...")
-        page.wait_for_selector("div.ui-jqgrid-hdiv", timeout=20000)
-
     except Exception as e:
-        log.error("An error occurred during the login process. Saving a screenshot for debugging.")
         page.screenshot(path="debug_screenshot.png", full_page=True)
-        raise RuntimeError(f"Failed to complete login process: {e}")
+        raise RuntimeError(f"Failed to complete login form steps: {e}")
 
-    log.info("Login process completed successfully.")
+    log.info("Login form submitted successfully. Expected to be on Home page.")
 
 def ensure_logged_in(
     context: BrowserContext,
@@ -124,73 +98,55 @@ def ensure_logged_in(
     timeout_ms: int,
     auth_state_path: Path,
 ) -> None:
+    # This function's only job is to make sure the context is authenticated.
+    # It doesn't care which page it lands on after login.
     page = context.new_page()
-    log.info("Opening visits URL to test auth…")
+    log.info("Checking authentication by navigating to target URL...")
     try:
         page.goto(visits_url, wait_until="domcontentloaded", timeout=timeout_ms)
-        page.wait_for_load_state("networkidle", timeout=15000)
+        # Give it a moment to redirect to the login page if needed
+        page.wait_for_load_state("load", timeout=20000)
     except PWTimeout:
-        log.warning("Network idle timeout during initial auth test, continuing...")
+        log.warning("Page took a long time to load during auth check, continuing...")
 
     if looks_like_login(page):
         log.info("Detected login page — performing login.")
         try_fill_login(page, username, password, timeout_ms=timeout_ms)
+        # After login, we might be on the home page. Check we are not on a login page.
         if looks_like_login(page):
-            page.wait_for_timeout(2000)
-            if looks_like_login(page):
-                raise RuntimeError("Login did not succeed (still on login page).")
-        log.info("Login successful.")
+            raise RuntimeError("Login did not succeed (still on login page after attempt).")
+        log.info("Login successful. Saving authentication state.")
         context.storage_state(path=str(auth_state_path))
     else:
         log.info("Existing auth state looks valid; no login needed.")
     page.close()
 
-def normalize_payloads_to_df(payloads: List[Dict[str, Any]]) -> Optional[pd.DataFrame]:
-    if not payloads: return None
-    api_response = payloads[0].get("data")
-    if api_response and "Rows" in api_response and isinstance(api_response["Rows"], list):
-        rows = api_response["Rows"]
-        if rows: return pd.json_normalize(rows)
-    return None
-
 def parse_visible_table_to_df(page: Page) -> Optional[pd.DataFrame]:
     log.info("Starting precise HTML table parsing with BeautifulSoup.")
-
     header_table_locator = page.locator("div.ui-jqgrid-hdiv table.ui-jqgrid-htable").first
     if not header_table_locator.count():
-        log.warning("Could not find the jqgrid header table.")
         return None
-
     header_html = header_table_locator.inner_html()
     soup_headers = BeautifulSoup(header_html, "lxml")
     headers = [th.get_text(strip=True) for th in soup_headers.select("thead tr th") if th.get_text(strip=True)]
 
     body_table_locator = page.locator("table.ui-jqgrid-btable:visible").first
     if not body_table_locator.count():
-        log.warning("Could not find the jqgrid body table.")
         return None
-
     body_html = body_table_locator.inner_html()
     soup_body = BeautifulSoup(body_html, "lxml")
+    data_rows = [
+        [cell.get_text(strip=True) for cell in row.find_all("td")]
+        for row in soup_body.select("tbody tr:not(.jqgfirstrow)")
+        if any(cell.get_text(strip=True) for cell in row.find_all("td"))
+    ]
 
-    data_rows = []
-    for row in soup_body.select("tbody tr:not(.jqgfirstrow)"):
-        cells = [cell.get_text(strip=True) for cell in row.find_all("td")]
-        if any(cells):
-            data_rows.append(cells)
-
-    if not data_rows:
-        log.warning("No data rows found in the parsed HTML body.")
-        return None
-
+    if not data_rows: return None
     df = pd.DataFrame(data_rows)
-
     if len(headers) == df.shape[1]:
         df.columns = headers
     else:
-        log.warning(f"Header count ({len(headers)}) does not match column count ({df.shape[1]}).")
         df.columns = [f"col_{i+1}" for i in range(df.shape[1])]
-
     df.dropna(how='all', inplace=True)
     return df
 
@@ -200,12 +156,7 @@ def post_to_google_chat(df: pd.DataFrame, webhook_url: str, site_id: str):
         return
 
     log.info("Filtering deliveries for today and formatting message...")
-
-    time_col = 'PTA Time'
     date_col = 'PTA Date'
-    quantity_col = 'Planned Quantity'
-    salvage_col = 'Has Planned Asset Return'
-
     if date_col not in df.columns:
         log.error(f"Date column '{date_col}' not found. Cannot filter for today's deliveries.")
         todays_deliveries_df = df
@@ -214,42 +165,25 @@ def post_to_google_chat(df: pd.DataFrame, webhook_url: str, site_id: str):
         log.info(f"Filtering for deliveries on: {today_str}")
         todays_deliveries_df = df[df[date_col] == today_str].copy()
 
-    delivery_lines = []
     if todays_deliveries_df.empty:
         log.info("No deliveries found for today.")
         full_message_text = "No deliveries scheduled for today."
     else:
         log.info(f"Found {len(todays_deliveries_df)} deliveries for today.")
+        delivery_lines = []
         for index, row in todays_deliveries_df.iterrows():
-            pta_time = row.get(time_col, "No Time")
+            pta_time = row.get('PTA Time', "No Time")
             try:
-                quantity = int(float(row.get(quantity_col, 0)))
+                quantity = int(float(row.get('Planned Quantity', 0)))
                 quantity_text = f"{quantity} Pallets"
             except (ValueError, TypeError):
                 quantity_text = "0 Pallets"
-
-            salvage_status = row.get(salvage_col, "No")
+            salvage_status = row.get('Has Planned Asset Return', "No")
             salvage_text = "salvage" if str(salvage_status).lower() == "yes" else "no salvage"
-
             delivery_lines.append(f"{pta_time}: {quantity_text}, {salvage_text}")
-
         full_message_text = "\n".join(delivery_lines)
 
-    message = {
-        "cardsV2": [{
-            "cardId": "delivery_plan_today",
-            "card": {
-                "header": {
-                    "title": f"Today's Delivery Plan for Store {site_id}",
-                    "subtitle": f"Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                    "imageUrl": "https://www.microlise.com/wp-content/uploads/2021/02/Microlise_Logo_Colour_RGB-1.png",
-                    "imageType": "SQUARE"
-                },
-                "sections": [{"widgets": [{"textParagraph": {"text": full_message_text}}]}]
-            }
-        }]
-    }
-
+    message = { "cardsV2": [{ "cardId": "delivery_plan_today", "card": { "header": { "title": f"Today's Delivery Plan for Store {site_id}", "subtitle": f"Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", "imageUrl": "https://www.microlise.com/wp-content/uploads/2021/02/Microlise_Logo_Colour_RGB-1.png", "imageType": "SQUARE" }, "sections": [{"widgets": [{"textParagraph": {"text": full_message_text}}]}] } }] }
     log.info("Sending message to Google Chat webhook...")
     try:
         response = requests.post(webhook_url, json=message, timeout=10)
@@ -258,13 +192,13 @@ def post_to_google_chat(df: pd.DataFrame, webhook_url: str, site_id: str):
     except requests.exceptions.RequestException as e:
         log.error(f"Failed to post message to Google Chat: {e}")
 
-
 # --- Main Execution ---
 
 def main():
     parser = argparse.ArgumentParser(description="Microlise TMC → Site Visits scraper (Playwright).")
     parser.add_argument("--username", default=DEFAULT_USERNAME)
     parser.add_argument("--password", default=DEFAULT_PASSWORD)
+    # ... (rest of the arguments) ...
     parser.add_argument("--site-id", default="218")
     parser.add_argument("--auth-state", default=DEFAULT_AUTH_STATE)
     parser.add_argument("--headless", default="true", choices=["true", "false"])
@@ -272,24 +206,27 @@ def main():
     parser.add_argument("--csv", default="visits.csv")
     parser.add_argument("--json", default="visits_raw.json")
     parser.add_argument("--screenshot", default="debug_screenshot.png")
-    parser.add_argument("--api-wait-timeout", type=int, default=15000) # Can be shorter now
+    parser.add_argument("--api-wait-timeout", type=int, default=15000)
     parser.add_argument("--webhook-url", default=DEFAULT_WEBHOOK_URL)
     args = parser.parse_args()
 
-    auth_state_path = Path(args.auth_state)
-    headless = args.headless.lower() == "true"
-    visits_url = f"{BASE}{VISITS_PATH_TMPL.format(site_id=args.site_id)}"
 
+    auth_state_path = Path(args.auth_state)
+    visits_url = f"{BASE}{VISITS_PATH_TMPL.format(site_id=args.site_id)}"
     log.info(f"Target visits URL: {visits_url}")
-    log.info(f"Auth state file: {auth_state_path}")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        context = browser.new_context(storage_state=str(auth_state_path) if auth_state_path.exists() else None)
+        browser = p.chromium.launch(headless=args.headless.lower() == "true")
+        context_opts = {}
+        if auth_state_path.exists():
+            context_opts["storage_state"] = str(auth_state_path)
+        context = browser.new_context(**context_opts)
+        
         page = None
         final_df = None
 
         try:
+            # Step 1: Make sure we are logged in. This might leave us on the Home page.
             ensure_logged_in(
                 context=context,
                 visits_url=visits_url,
@@ -299,66 +236,35 @@ def main():
                 auth_state_path=auth_state_path,
             )
 
+            # Step 2: Now that we are authenticated, navigate DIRECTLY to the visits page.
             page = context.new_page()
-            log.info("Navigating to visits page…")
-            page.goto(visits_url, wait_until="domcontentloaded", timeout=args.timeout)
+            log.info("Authentication complete. Navigating directly to the Site Visits page...")
+            page.goto(visits_url, wait_until="load", timeout=args.timeout)
+            log.info("Successfully landed on the Site Visits page.")
 
-            api_data: Optional[Dict[str, Any]] = None
-            response_captured_event = threading.Event()
-
-            def _on_response(response: Response):
-                nonlocal api_data
-                if LIST_VISITS_API_PATH_FRAGMENT in response.url and response.status == 200:
-                    log.info(f"Intercepted target API call: {response.url}")
-                    try:
-                        body = response.body()
-                        json_data = json.loads(body)
-                        if json_data and json_data.get("Rows") is not None:
-                            api_data = json_data
-                            response_captured_event.set()
-                    except Exception as e:
-                        log.warning(f"Could not parse JSON from API response body: {e}")
-
-            log.info("Setting up API listener before refresh...")
-            page.on("response", _on_response)
-
-            log.info("Refreshing the page to trigger data grid...")
+            # Step 3: Refresh the page to trigger the data grid's API call.
+            log.info("Refreshing the page to ensure data grid initializes...")
             page.reload(wait_until="domcontentloaded", timeout=30000)
+            
+            # Step 4: Wait for the grid to load its data. We will use the HTML fallback
+            # method as it has proven to be the most reliable in this environment.
+            log.info("Waiting for data rows to appear in the HTML table...")
+            real_row_selector = "table.ui-jqgrid-btable tbody tr:not(.jqgfirstrow)"
+            try:
+                page.wait_for_selector(real_row_selector, timeout=25000)
+                log.info("Real data rows found in table. Proceeding with HTML parsing.")
+            except PWTimeout:
+                log.error("Timed out waiting for data rows in the HTML table after refresh.")
+                raise RuntimeError("Could not find data in the HTML table.")
 
-            log.info(f"Waiting for ListVisits API response event (max {args.api_wait_timeout / 1000}s)...")
-            response_captured_event.wait(timeout=args.api_wait_timeout / 1000)
+            final_df = parse_visible_table_to_df(page)
+            if final_df is None or final_df.empty:
+                raise RuntimeError("HTML table parsing failed even after waiting for rows.")
 
-            page.remove_listener("response", _on_response)
-
-            if api_data:
-                log.info("Successfully captured API data.")
-                payloads = [{"url": "API_CAPTURE", "data": api_data}]
-                df = normalize_payloads_to_df(payloads)
-                if df is not None and not df.empty:
-                    log.info(f"--- Scraped Data (from API) ---\n{df.to_string()}")
-                    final_df = df
-
-            if final_df is None:
-                log.warning("API data capture failed or was empty. Falling back to HTML table parsing.")
-                real_row_selector = "table.ui-jqgrid-btable tbody tr:not(.jqgfirstrow)"
-                try:
-                    log.info("Waiting for real data rows to appear in the HTML table...")
-                    page.wait_for_selector(real_row_selector, timeout=20000)
-                    log.info("Real data rows found in table. Proceeding with HTML parsing.")
-                except PWTimeout:
-                    log.error("Timed out waiting for real data rows in the HTML table.")
-                    raise RuntimeError("Could not find any data via API or in the HTML table after refresh.")
-
-                df = parse_visible_table_to_df(page)
-                if df is None or df.empty:
-                    raise RuntimeError("HTML table parsing failed even after waiting for real rows.")
-                log.info(f"--- Scraped Data (from HTML Table) ---\n{df.to_string()}")
-                final_df = df
-
-            if final_df is not None and not final_df.empty:
-                final_df.to_csv(args.csv, index=False)
-                log.info(f"Wrote final data to CSV: {args.csv} (rows={final_df.shape[0]})")
-                post_to_google_chat(final_df, args.webhook_url, args.site_id)
+            log.info(f"--- Scraped Data (from HTML Table) ---\n{final_df.to_string()}")
+            final_df.to_csv(args.csv, index=False)
+            log.info(f"Wrote final data to CSV: {args.csv} (rows={final_df.shape[0]})")
+            post_to_google_chat(final_df, args.webhook_url, args.site_id)
 
         except Exception as e:
             log.exception(f"Scrape failed: {e}")
@@ -367,10 +273,8 @@ def main():
                 log.info(f"Saved debug screenshot: {args.screenshot}")
             raise
         finally:
-            if 'context' in locals() and context:
-                context.close()
-            if 'browser' in locals() and browser.is_connected():
-                browser.close()
+            if 'context' in locals() and context: context.close()
+            if 'browser' in locals() and browser.is_connected(): browser.close()
 
 if __name__ == "__main__":
     main()

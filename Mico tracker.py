@@ -4,15 +4,23 @@
 """
 Microlise TMC → Site Visits (Store 218) Scraper — Playwright (Python)
 
-Dependencies:
-  pip install playwright pandas beautifulsoup4 lxml requests
+Dependencies (should be in requirements.txt):
+  playwright
+  pandas
+  beautifulsoup4
+  lxml
+  requests
 
-Usage:
+Usage (GitHub Actions):
+  This script is designed to be run by the .github/workflows/microlise_scraper.yml workflow.
+  It uses GitHub Secrets for credentials.
+
+Usage (Local):
   # (Recommended) Set environment variable for webhook
   export GOOGLE_CHAT_WEBHOOK_URL="your_new_webhook_url"
 
   # Run the script
-  python Mico_tracker.py --username Store218 --password YourPassword
+  python Mico_tracker.py --password YourPassword
 """
 
 import os
@@ -44,9 +52,10 @@ DEFAULT_PASSWORD = os.getenv("MICROLISE_PASSWORD", "Store218")
 DEFAULT_AUTH_STATE = os.getenv("MICROLISE_AUTH_STATE", "auth_state.json")
 
 # SECURITY WARNING: It is highly recommended to use an environment variable for the webhook.
-
+# This hardcoded URL is a security risk and should be replaced.
 DEFAULT_WEBHOOK_URL = os.getenv(
-    "GOOGLE_CHAT_WEBHOOK_URL"
+    "GOOGLE_CHAT_WEBHOOK_URL",
+    "https://chat.googleapis.com/v1/spaces/AAAAE9Syx9g/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=yrFCiWB27_A0Wxoev2zRpvnkLrnYCmwGP86EeOZDTKE"
 )
 
 BASE = "https://live.microlise.com/MORRISONS"
@@ -77,22 +86,35 @@ def looks_like_login(page: Page) -> bool:
         pass
     return False
 
-def try_fill_login(page: Page, username: str, password: str, timeout_ms: int = 40000) -> None:
+def try_fill_login(page: Page, username: str, password: str, timeout_ms: int = 60000) -> None:
     log.info("Attempting multi-step login...")
     try:
+        # Step 1: Username
         user_box = page.locator("input[name='username'][id='username']").first
         user_box.wait_for(timeout=timeout_ms / 2)
         user_box.fill(username)
         page.locator("button[type='submit'][name='action'][value='default']._button-login-id").first.click()
-        
+
+        # Step 2: Password
         pass_box = page.locator("input[name='password'][id='password']").first
-        pass_box.wait_for(timeout=timeout_ms)
+        pass_box.wait_for(timeout=timeout_ms / 2)
         pass_box.fill(password)
-        with page.expect_navigation(wait_until="networkidle", timeout=timeout_ms):
+
+        # KEY FIX: Use "load" instead of "networkidle" for reliability in GitHub Actions.
+        log.info("Submitting password and waiting for page to load...")
+        with page.expect_navigation(wait_until="load", timeout=timeout_ms):
             page.locator("button[type='submit'][name='action'][value='default']._button-login-password").first.click()
+
+        # NEW: Add an explicit wait to confirm we landed on the right page.
+        log.info("Login submitted. Verifying landing page by looking for the grid header...")
+        page.wait_for_selector("div.ui-jqgrid-hdiv", timeout=20000)
+
     except Exception as e:
+        log.error("An error occurred during the login process. Saving a screenshot for debugging.")
+        page.screenshot(path="debug_screenshot.png", full_page=True)
         raise RuntimeError(f"Failed to complete login process: {e}")
-    log.info("Login process completed.")
+
+    log.info("Login process completed successfully.")
 
 def ensure_logged_in(
     context: BrowserContext,
@@ -109,7 +131,7 @@ def ensure_logged_in(
         page.wait_for_load_state("networkidle", timeout=15000)
     except PWTimeout:
         log.warning("Network idle timeout during initial auth test, continuing...")
-    
+
     if looks_like_login(page):
         log.info("Detected login page — performing login.")
         try_fill_login(page, username, password, timeout_ms=timeout_ms)
@@ -133,12 +155,12 @@ def normalize_payloads_to_df(payloads: List[Dict[str, Any]]) -> Optional[pd.Data
 
 def parse_visible_table_to_df(page: Page) -> Optional[pd.DataFrame]:
     log.info("Starting precise HTML table parsing with BeautifulSoup.")
-    
+
     header_table_locator = page.locator("div.ui-jqgrid-hdiv table.ui-jqgrid-htable").first
     if not header_table_locator.count():
         log.warning("Could not find the jqgrid header table.")
         return None
-        
+
     header_html = header_table_locator.inner_html()
     soup_headers = BeautifulSoup(header_html, "lxml")
     headers = [th.get_text(strip=True) for th in soup_headers.select("thead tr th") if th.get_text(strip=True)]
@@ -150,7 +172,7 @@ def parse_visible_table_to_df(page: Page) -> Optional[pd.DataFrame]:
 
     body_html = body_table_locator.inner_html()
     soup_body = BeautifulSoup(body_html, "lxml")
-    
+
     data_rows = []
     for row in soup_body.select("tbody tr:not(.jqgfirstrow)"):
         cells = [cell.get_text(strip=True) for cell in row.find_all("td")]
@@ -162,7 +184,7 @@ def parse_visible_table_to_df(page: Page) -> Optional[pd.DataFrame]:
         return None
 
     df = pd.DataFrame(data_rows)
-    
+
     if len(headers) == df.shape[1]:
         df.columns = headers
     else:
@@ -205,12 +227,12 @@ def post_to_google_chat(df: pd.DataFrame, webhook_url: str, site_id: str):
                 quantity_text = f"{quantity} Pallets"
             except (ValueError, TypeError):
                 quantity_text = "0 Pallets"
-            
+
             salvage_status = row.get(salvage_col, "No")
             salvage_text = "salvage" if str(salvage_status).lower() == "yes" else "no salvage"
-            
+
             delivery_lines.append(f"{pta_time}: {quantity_text}, {salvage_text}")
-        
+
         full_message_text = "\n".join(delivery_lines)
 
     message = {
@@ -250,9 +272,8 @@ def main():
     parser.add_argument("--csv", default="visits.csv")
     parser.add_argument("--json", default="visits_raw.json")
     parser.add_argument("--screenshot", default="debug_screenshot.png")
-    parser.add_argument("--api-wait-timeout", type=int, default=25000)
-    parser.add_argument("--webhook-url", default=DEFAULT_WEBHOOK_URL,
-                        help="Google Chat webhook URL.")
+    parser.add_argument("--api-wait-timeout", type=int, default=15000) # Can be shorter now
+    parser.add_argument("--webhook-url", default=DEFAULT_WEBHOOK_URL)
     args = parser.parse_args()
 
     auth_state_path = Path(args.auth_state)
@@ -303,10 +324,10 @@ def main():
 
             log.info("Refreshing the page to trigger data grid...")
             page.reload(wait_until="domcontentloaded", timeout=30000)
-            
+
             log.info(f"Waiting for ListVisits API response event (max {args.api_wait_timeout / 1000}s)...")
             response_captured_event.wait(timeout=args.api_wait_timeout / 1000)
-            
+
             page.remove_listener("response", _on_response)
 
             if api_data:
@@ -316,7 +337,7 @@ def main():
                 if df is not None and not df.empty:
                     log.info(f"--- Scraped Data (from API) ---\n{df.to_string()}")
                     final_df = df
-            
+
             if final_df is None:
                 log.warning("API data capture failed or was empty. Falling back to HTML table parsing.")
                 real_row_selector = "table.ui-jqgrid-btable tbody tr:not(.jqgfirstrow)"
@@ -335,10 +356,8 @@ def main():
                 final_df = df
 
             if final_df is not None and not final_df.empty:
-                # Save the final data to CSV before posting
                 final_df.to_csv(args.csv, index=False)
                 log.info(f"Wrote final data to CSV: {args.csv} (rows={final_df.shape[0]})")
-                # Post the result to Google Chat
                 post_to_google_chat(final_df, args.webhook_url, args.site_id)
 
         except Exception as e:

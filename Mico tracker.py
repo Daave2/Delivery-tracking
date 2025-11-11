@@ -3,7 +3,7 @@
 
 """
 Microlise TMC → Site Visits (Store 218) Scraper — Playwright (Python)
-Final version, handles redirect to Home page after login.
+Final version, handles redirect to Home page after login and session initialization delay.
 """
 
 import os
@@ -42,7 +42,6 @@ DEFAULT_WEBHOOK_URL = os.getenv(
 BASE = "https://live.microlise.com/MORRISONS"
 AUTH_BASE = "https://auth.microlise.com"
 VISITS_PATH_TMPL = "/TMCWebPortal/Site/Visits/{site_id}?siteIdEncoded=False"
-LIST_VISITS_API_PATH_FRAGMENT = "/TMCWebPortal/Site/ListVisits"
 LOGIN_KEYWORDS = ("login", "log in", "sign in", "authentication", "identifier")
 
 logging.basicConfig(
@@ -59,7 +58,6 @@ def looks_like_login(page: Page) -> bool:
     if AUTH_BASE.lower() in url or any(k in url for k in LOGIN_KEYWORDS):
         return True
     try:
-        # Use short timeouts here to avoid long waits
         if page.locator("input[type='password']").is_visible(timeout=2000): return True
         if page.locator("input[name='username']").is_visible(timeout=2000): return True
     except Exception:
@@ -69,26 +67,22 @@ def looks_like_login(page: Page) -> bool:
 def try_fill_login(page: Page, username: str, password: str, timeout_ms: int = 60000) -> None:
     log.info("Attempting multi-step login...")
     try:
-        # Step 1: Username
         user_box = page.locator("input[name='username'][id='username']").first
         user_box.wait_for(state="visible", timeout=timeout_ms / 2)
         user_box.fill(username)
         page.locator("button[type='submit'][name='action'][value='default']._button-login-id").first.click()
 
-        # Step 2: Password
         pass_box = page.locator("input[name='password'][id='password']").first
         pass_box.wait_for(state="visible", timeout=timeout_ms / 2)
         pass_box.fill(password)
 
-        # Submit and wait for whatever navigation happens next.
-        log.info("Submitting password and waiting for navigation to complete...")
+        log.info("Submitting password and waiting for navigation...")
         with page.expect_navigation(wait_until="load", timeout=timeout_ms):
             page.locator("button[type='submit'][name='action'][value='default']._button-login-password").first.click()
 
     except Exception as e:
         page.screenshot(path="debug_screenshot.png", full_page=True)
         raise RuntimeError(f"Failed during login form steps: {e}")
-
     log.info("Login form submitted.")
 
 
@@ -110,8 +104,18 @@ def ensure_logged_in(
     if looks_like_login(page):
         log.info("Detected login page — performing login.")
         try_fill_login(page, username, password, timeout_ms=timeout_ms)
-        # Trust that the login worked. We will verify by navigating to the page in main().
-        log.info("Login attempt complete. Saving authentication state.")
+
+        # --- KEY FIX: Add a pause AFTER login to allow the session to initialize ---
+        log.info("Login submitted. Pausing for 5 seconds to allow session to stabilize...")
+        page.wait_for_timeout(5000)
+
+        # Now, check if we are STILL on a login page. This would be a true failure (wrong password).
+        if looks_like_login(page):
+            log.error("Login was rejected. Still on a login page after waiting.")
+            page.screenshot(path="debug_screenshot.png", full_page=True)
+            raise RuntimeError("Login failed, likely due to incorrect credentials.")
+
+        log.info("Login successful. Saving authentication state.")
         context.storage_state(path=str(auth_state_path))
     else:
         log.info("Already logged in; auth state is valid.")
@@ -219,7 +223,7 @@ def main():
         final_df = None
 
         try:
-            # Step 1: Make sure we are logged in. This may leave us on the Home page.
+            # Step 1: Ensure we are logged in. This function now handles the post-login delay.
             ensure_logged_in(
                 context=context,
                 visits_url=visits_url,
@@ -229,12 +233,12 @@ def main():
                 auth_state_path=auth_state_path,
             )
 
-            # Step 2: Now that we are authenticated, navigate DIRECTLY to the visits page.
+            # Step 2: Now that the session is stable, navigate directly to the visits page.
             page = context.new_page()
             log.info("Navigating to the Site Visits page to get data...")
             page.goto(visits_url, wait_until="load", timeout=args.timeout)
 
-            # Step 3: Verify we are on the correct page. If not, fail gracefully.
+            # Step 3: Verify we are on the correct page.
             if looks_like_login(page):
                 log.error("Authentication failed. Landed on login page when trying to access visits.")
                 raise RuntimeError("Authentication failed; could not access protected page.")

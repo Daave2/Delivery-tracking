@@ -157,13 +157,38 @@ def post_to_google_chat(df: pd.DataFrame, webhook_url: str, site_id: str):
 
     log.info("Filtering deliveries for today and formatting message...")
     date_col = 'PTA Date'
+    now_dt = datetime.now()
     if date_col not in df.columns:
         log.error(f"Date column '{date_col}' not found. Cannot filter for today's deliveries.")
         todays_deliveries_df = df
     else:
-        today_str = datetime.now().strftime('%d/%m/%Y')
+        today_str = now_dt.strftime('%d/%m/%Y')
         log.info(f"Filtering for deliveries on: {today_str}")
         todays_deliveries_df = df[df[date_col] == today_str].copy()
+
+    if not todays_deliveries_df.empty and 'PTA Time' in todays_deliveries_df.columns:
+        log.info("Removing deliveries scheduled before the current time.")
+        combined_datetime = (
+            todays_deliveries_df[date_col].astype(str).str.strip()
+            + " "
+            + todays_deliveries_df['PTA Time'].astype(str).str.strip()
+        )
+        delivery_datetimes = pd.to_datetime(
+            combined_datetime,
+            errors='coerce',
+            dayfirst=True,
+        )
+        valid_mask = delivery_datetimes.isna() | (delivery_datetimes >= now_dt)
+        removed_count = int((~valid_mask).sum())
+        if removed_count:
+            log.info(
+                "Excluding %d deliveries that are scheduled before %s.",
+                removed_count,
+                now_dt.strftime('%H:%M'),
+            )
+        todays_deliveries_df = todays_deliveries_df[valid_mask].copy()
+    elif not todays_deliveries_df.empty:
+        log.warning("'PTA Time' column missing; cannot filter past deliveries by time.")
 
     if todays_deliveries_df.empty:
         log.info("No deliveries found for today.")
@@ -183,7 +208,7 @@ def post_to_google_chat(df: pd.DataFrame, webhook_url: str, site_id: str):
             delivery_lines.append(f"{pta_time}: {quantity_text}, {salvage_text}")
         full_message_text = "\n".join(delivery_lines)
 
-    message = { "cardsV2": [{ "cardId": "delivery_plan_today", "card": { "header": { "title": f"Today's Delivery Plan for Store {site_id}", "subtitle": f"Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", "imageUrl": "https://www.microlise.com/wp-content/uploads/2021/02/Microlise_Logo_Colour_RGB-1.png", "imageType": "SQUARE" }, "sections": [{"widgets": [{"textParagraph": {"text": full_message_text}}]}] } }] }
+    message = { "cardsV2": [{ "cardId": "delivery_plan_today", "card": { "header": { "title": f"Today's Delivery Plan for Store {site_id}", "subtitle": f"Generated on {now_dt.strftime('%Y-%m-%d %H:%M:%S')}", "imageUrl": "https://www.microlise.com/wp-content/uploads/2021/02/Microlise_Logo_Colour_RGB-1.png", "imageType": "SQUARE" }, "sections": [{"widgets": [{"textParagraph": {"text": full_message_text}}]}] } }] }
     log.info("Sending message to Google Chat webhook...")
     try:
         response = requests.post(webhook_url, json=message, timeout=10)

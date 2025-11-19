@@ -150,7 +150,13 @@ def parse_visible_table_to_df(page: Page) -> Optional[pd.DataFrame]:
     return df
 
 
-def post_to_google_chat(df: pd.DataFrame, webhook_url: str, site_id: str):
+def post_to_google_chat(
+    df: pd.DataFrame,
+    webhook_url: str,
+    site_id: str,
+    max_attempts: int = 3,
+    wait_seconds: int = 5,
+):
     if not webhook_url:
         log.warning("Google Chat webhook URL is not set. Skipping notification.")
         return
@@ -210,12 +216,28 @@ def post_to_google_chat(df: pd.DataFrame, webhook_url: str, site_id: str):
 
     message = { "cardsV2": [{ "cardId": "delivery_plan_today", "card": { "header": { "title": f"Today's Delivery Plan for Store {site_id}", "subtitle": f"Generated on {now_dt.strftime('%Y-%m-%d %H:%M:%S')}", "imageUrl": "https://www.microlise.com/wp-content/uploads/2021/02/Microlise_Logo_Colour_RGB-1.png", "imageType": "SQUARE" }, "sections": [{"widgets": [{"textParagraph": {"text": full_message_text}}]}] } }] }
     log.info("Sending message to Google Chat webhook...")
-    try:
-        response = requests.post(webhook_url, json=message, timeout=10)
-        response.raise_for_status()
-        log.info("Successfully posted message to Google Chat.")
-    except requests.exceptions.RequestException as e:
-        log.error(f"Failed to post message to Google Chat: {e}")
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.post(webhook_url, json=message, timeout=10)
+            response.raise_for_status()
+            log.info("Successfully posted message to Google Chat on attempt %d.", attempt)
+            return
+        except requests.exceptions.RequestException as e:
+            if attempt >= max_attempts:
+                log.error(
+                    "Failed to post message to Google Chat after %d attempts: %s",
+                    max_attempts,
+                    e,
+                )
+            else:
+                log.warning(
+                    "Google Chat post attempt %d/%d failed: %s. Retrying in %d seconds...",
+                    attempt,
+                    max_attempts,
+                    e,
+                    wait_seconds,
+                )
+                time.sleep(wait_seconds)
 
 
 # --- Main Execution ---
@@ -231,6 +253,14 @@ def main():
     parser.add_argument("--csv", default="visits.csv")
     parser.add_argument("--screenshot", default="debug_screenshot.png")
     parser.add_argument("--webhook-url", default=DEFAULT_WEBHOOK_URL)
+    parser.add_argument("--retries", type=int, default=3, help="Number of scrape retries")
+    parser.add_argument("--retry-wait", type=int, default=5, help="Seconds to wait between retries")
+    parser.add_argument(
+        "--webhook-retries",
+        type=int,
+        default=3,
+        help="Number of times to retry posting to the webhook",
+    )
     args = parser.parse_args()
 
     auth_state_path = Path(args.auth_state)
@@ -248,57 +278,73 @@ def main():
         final_df = None
 
         try:
-            # Step 1: Ensure we are logged in. This function now handles the post-login delay.
-            ensure_logged_in(
-                context=context,
-                visits_url=visits_url,
-                username=args.username,
-                password=args.password,
-                timeout_ms=args.timeout,
-                auth_state_path=auth_state_path,
-            )
+            for attempt in range(1, args.retries + 1):
+                page = None
+                log.info("Starting scrape attempt %d/%d", attempt, args.retries)
+                try:
+                    # Ensure we are logged in before each attempt in case a previous run invalidated the session.
+                    ensure_logged_in(
+                        context=context,
+                        visits_url=visits_url,
+                        username=args.username,
+                        password=args.password,
+                        timeout_ms=args.timeout,
+                        auth_state_path=auth_state_path,
+                    )
 
-            # Step 2: Now that the session is stable, navigate directly to the visits page.
-            page = context.new_page()
-            log.info("Navigating to the Site Visits page to get data...")
-            page.goto(visits_url, wait_until="load", timeout=args.timeout)
+                    page = context.new_page()
+                    log.info("Navigating to the Site Visits page to get data...")
+                    page.goto(visits_url, wait_until="load", timeout=args.timeout)
 
-            # Step 3: Verify we are on the correct page.
-            if looks_like_login(page):
-                log.error("Authentication failed. Landed on login page when trying to access visits.")
-                raise RuntimeError("Authentication failed; could not access protected page.")
-            
-            log.info("Successfully on the Site Visits page.")
+                    # Verify we are on the correct page.
+                    if looks_like_login(page):
+                        raise RuntimeError(
+                            "Authentication failed; landed on login page when trying to access visits."
+                        )
 
-            # Step 4: Refresh the page to trigger the data grid's API call.
-            log.info("Refreshing page to ensure data grid populates...")
-            page.reload(wait_until="domcontentloaded", timeout=30000)
-            
-            # Step 5: Wait for the grid to load its data.
-            log.info("Waiting for data rows to appear in the HTML table...")
-            real_row_selector = "table.ui-jqgrid-btable tbody tr:not(.jqgfirstrow)"
-            try:
-                page.wait_for_selector(real_row_selector, timeout=25000)
-                log.info("Real data rows found in table.")
-            except PWTimeout:
-                log.error("Timed out waiting for data rows in the HTML table after refresh.")
-                raise RuntimeError("Could not find data in the HTML table.")
+                    log.info("Successfully on the Site Visits page.")
 
-            final_df = parse_visible_table_to_df(page)
-            if final_df is None or final_df.empty:
-                raise RuntimeError("HTML table parsing failed even after waiting for rows.")
+                    # Refresh the page to trigger the data grid's API call.
+                    log.info("Refreshing page to ensure data grid populates...")
+                    page.reload(wait_until="domcontentloaded", timeout=30000)
 
-            log.info(f"--- Scraped Data ---\n{final_df.to_string()}")
-            final_df.to_csv(args.csv, index=False)
-            log.info(f"Wrote final data to CSV: {args.csv} (rows={final_df.shape[0]})")
-            post_to_google_chat(final_df, args.webhook_url, args.site_id)
+                    # Wait for the grid to load its data.
+                    log.info("Waiting for data rows to appear in the HTML table...")
+                    real_row_selector = "table.ui-jqgrid-btable tbody tr:not(.jqgfirstrow)"
+                    try:
+                        page.wait_for_selector(real_row_selector, timeout=25000)
+                        log.info("Real data rows found in table.")
+                    except PWTimeout:
+                        raise RuntimeError("Timed out waiting for data rows in the HTML table after refresh.")
 
-        except Exception as e:
-            log.exception(f"Scrape failed: {e}")
-            if page and not page.is_closed():
-                page.screenshot(path=args.screenshot, full_page=True)
-                log.info(f"Saved debug screenshot: {args.screenshot}")
-            raise
+                    final_df = parse_visible_table_to_df(page)
+                    if final_df is None or final_df.empty:
+                        raise RuntimeError("HTML table parsing failed even after waiting for rows.")
+
+                    log.info(f"--- Scraped Data ---\n{final_df.to_string()}")
+                    final_df.to_csv(args.csv, index=False)
+                    log.info(f"Wrote final data to CSV: {args.csv} (rows={final_df.shape[0]})")
+                    post_to_google_chat(
+                        final_df,
+                        args.webhook_url,
+                        args.site_id,
+                        max_attempts=args.webhook_retries,
+                        wait_seconds=args.retry_wait,
+                    )
+                    break
+                except Exception as e:
+                    log.exception(f"Scrape attempt {attempt}/{args.retries} failed: {e}")
+                    if page and not page.is_closed():
+                        page.screenshot(path=args.screenshot, full_page=True)
+                        log.info(f"Saved debug screenshot: {args.screenshot}")
+                    if attempt >= args.retries:
+                        raise
+                    log.info("Retrying in %d seconds...", args.retry_wait)
+                    time.sleep(args.retry_wait)
+                finally:
+                    if page and not page.is_closed():
+                        page.close()
+
         finally:
             if 'context' in locals() and context: context.close()
             if 'browser' in locals() and browser.is_connected(): browser.close()
